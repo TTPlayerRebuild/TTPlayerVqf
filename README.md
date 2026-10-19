@@ -20,3 +20,7 @@ TTPlayer 5.7.9 兼容的 x86 TwinVQ/VQF Reader 插件。恢复原工厂、Reader
 [重建依据、差异和验证](docs/IMPLEMENTATION_AND_VALIDATION.md) · [依赖及修改记录](docs/DEPENDENCIES.md)
 
 本项目恢复宿主行为和可维护解码实现；现代解码核心与原外部闭源库不保证 PCM 位精确相等。具体已验证范围和剩余边界见文档。
+
+## 可选格式识别接口
+
+2026-10-20：Reader 工厂增加 Probe，Reader 增加 SourceInfo；旧导出和接口槽位保持不变。声明与辅助实现位于 `include/ttpcomm/audio_format_probe.h` 和 `audio_format_probe_impl.h`，不增加运行时 DLL 依赖。协议原件在相邻 `ttpcomm/sdk/AUDIO_FORMAT_PROBE.md`；新建插件指南在相邻 `rebuild/docs/AUDIO_PLUGIN_DEVELOPMENT_GUIDE.md`。原版播放器继续使用旧接口；错误后缀候选选择和更名提示由支持新协议的重建播放器执行。

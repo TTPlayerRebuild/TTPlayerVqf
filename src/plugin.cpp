@@ -1,11 +1,19 @@
+#include "ttpcomm/audio_format_probe_impl.h"
 #include "common.h"
 namespace ttp::vqf {
 HMODULE module{};
 StandardContent standard_content() { return nullptr; }
-class Factory final : public ReaderCreator {
+class Factory final : public ReaderCreator, public ttp::format::ProbeSupport {
+protected:
+    DWORD ProbeFamilies() const noexcept override { return ttp::format::Vqf; }
+private:
+
     LONG refs_{1};
 public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id,void **out) override {
+        if (!out) return E_POINTER;
+        if (IsEqualIID(id, ttp::format::iid_probe)) { *out=static_cast<ttp::format::Probe*>(this); AddRef(); return S_OK; }
+
         if(!out)return E_POINTER; *out=nullptr;
         if(!same(id,IID_IUnknown)&&!same(id,cat_reader))return E_NOINTERFACE;
         *out=static_cast<ReaderCreator*>(this);AddRef();return S_OK;
