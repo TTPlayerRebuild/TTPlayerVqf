@@ -1,0 +1,88 @@
+name: Build TwinVQ plugin
+run-name: TwinVQ x86 Release - ${{ github.ref_name }}
+on:
+  workflow_dispatch:
+    inputs:
+      release_a_version:
+        description: Release a Version (GitHub)
+        type: boolean
+        required: false
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: ${{ inputs.release_a_version && 'manual-vqf-release' || format('manual-vqf-build-{0}', github.run_id) }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      previous: ${{ steps.version.outputs.previous }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Allocate Beijing date version before compilation
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REQUESTED: ${{ inputs.release_a_version }}
+        run: |
+          ./cmake/resolve_release_version.ps1 -Repository $env:GITHUB_REPOSITORY `
+            -ReleaseRequested:($env:RELEASE_REQUESTED -eq 'true')
+      - name: Build, audit imports and package
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_REQUESTED: ${{ inputs.release_a_version }}
+        run: |
+          ./build.ps1 -Package -SourcePackage:($env:RELEASE_REQUESTED -eq 'true') -PackageVersion $env:PACKAGE_VERSION
+          New-Item -ItemType Directory -Path artifact | Out-Null
+          Copy-Item -LiteralPath "build/Release/ttp_vqf-$env:PACKAGE_VERSION.zip",'build/Release/SHA256SUMS.txt' -Destination artifact
+          if ($env:RELEASE_REQUESTED -eq 'true') {
+            Copy-Item -LiteralPath "build/Release/ttp_vqf-$env:PACKAGE_VERSION-source.zip" -Destination artifact
+          }
+      # Private tests and binary reconstruction evidence stay in ../rebuild/tests.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ttp_vqf-x86-Release-${{ github.run_number }}
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14
+  github_release:
+    needs: build
+    if: inputs.release_a_version
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      RELEASE_VERSION: ${{ needs.build.outputs.version }}
+      PREVIOUS_VERSION: ${{ needs.build.outputs.previous }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ttp_vqf-x86-Release-${{ github.run_number }}
+          path: artifact
+      - name: Verify package and prepare release notes
+        run: |
+          ./cmake/prepare_release.ps1 -Version $env:RELEASE_VERSION -PreviousVersion $env:PREVIOUS_VERSION `
+            -Repository $env:GITHUB_REPOSITORY -Commit $env:GITHUB_SHA -ServerUrl $env:GITHUB_SERVER_URL
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$env:RELEASE_VERSION" "artifact/ttp_vqf-$env:RELEASE_VERSION.zip" "artifact/ttp_vqf-$env:RELEASE_VERSION-source.zip" artifact/SHA256SUMS.txt `
+            --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" `
+            --title "$env:RELEASE_VERSION" --notes-file artifact/release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed; existing releases are not overwritten.' }

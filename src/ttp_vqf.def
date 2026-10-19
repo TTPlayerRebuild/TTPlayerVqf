@@ -1,0 +1,3 @@
+LIBRARY ttp_vqf
+EXPORTS
+    ttpGetSoundAddIn=_ttpGetSoundAddIn@4 @1

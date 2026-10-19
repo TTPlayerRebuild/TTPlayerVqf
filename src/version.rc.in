@@ -1,0 +1,27 @@
+#include <winver.h>
+1 VERSIONINFO
+FILEVERSION @VQF_FIXED_VERSION@
+PRODUCTVERSION @VQF_FIXED_VERSION@
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_DLL
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Sonic853\0"
+      VALUE "FileDescription", "TTPlayer TwinVQ audio add-in\0"
+      VALUE "FileVersion", "@VQF_BUILD_VERSION@\0"
+      VALUE "InternalName", "ttp_vqf\0"
+      VALUE "OriginalFilename", "ttp_vqf.dll\0"
+      VALUE "ProductName", "TTPlayer Rebuild VQF\0"
+      VALUE "ProductVersion", "@VQF_BUILD_VERSION@\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
