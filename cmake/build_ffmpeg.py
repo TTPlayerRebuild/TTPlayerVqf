@@ -3,7 +3,7 @@
 Sources are downloaded at build time. GNU make is bootstrapped from official
 source in this build tree; no package manager or system configuration is changed.
 """
-import argparse, hashlib, json, os, pathlib, shutil, subprocess, tarfile, urllib.request
+import argparse, hashlib, json, os, pathlib, re, shutil, subprocess, sys, tarfile, urllib.request
 
 FFMPEG_VERSION = '9.0.2'
 FFMPEG_SHA256 = '8c3850283eb25fa026482078a04051e0be17347b09ef81a0849bec15a96e002e'
@@ -33,6 +33,25 @@ def vc_environment(vcvars, arch, folder):
 def posix(path):
     p=str(pathlib.Path(path).resolve()).replace('\\','/')
     return '/'+p[0].lower()+p[2:] if len(p)>1 and p[1]==':' else p
+
+def native_make_paths(content):
+    # Only a drive prefix at the beginning of a makefile path is MSYS syntax.
+    # Global /a/ replacement corrupts the runner's D:/a/<repo>/... directory,
+    # and also corrupts /d/a/<repo>/... before its /d/ prefix can be converted.
+    return re.sub(r'''(^|[ \t="'])/([a-zA-Z])/''',
+                  lambda m: m[1]+m[2].upper()+':/', content, flags=re.MULTILINE)
+
+def run_logged(command, *, cwd, env, log_path, phase, append=False):
+    try:
+        with log_path.open('a' if append else 'w', encoding='utf-8') as log:
+            log.write(phase+': '+subprocess.list2cmdline([str(x) for x in command])+'\n')
+            log.flush()
+            subprocess.run(command,cwd=cwd,env=env,stdout=log,
+                           stderr=subprocess.STDOUT,check=True)
+    except subprocess.CalledProcessError as error:
+        tail='\n'.join(log_path.read_text(encoding='utf-8',errors='replace').splitlines()[-60:])
+        print(f'{phase} failed; last log lines ({log_path}):\n{tail}',file=sys.stderr,flush=True)
+        raise RuntimeError(f'{phase} failed with exit code {error.returncode}; see {log_path}') from error
 
 def main():
     ap=argparse.ArgumentParser()
@@ -107,9 +126,8 @@ def main():
         if not make_source.exists():
             tar=a.make_archive.resolve() if a.make_archive else b/'make-4.4.1.tar.gz'
             download('https://ftp.gnu.org/gnu/make/'+tar.name,tar,MAKE_SHA256);extract(tar,b)
-        with (b/'make-build.log').open('w') as log:
-            subprocess.run(['cmd','/d','/c','build_w32.bat','--without-guile'],cwd=make_source,
-                env=vc_environment(vcvars,'x64',b),stdout=log,stderr=subprocess.STDOUT,check=True)
+        run_logged(['cmd','/d','/c','build_w32.bat','--without-guile'],cwd=make_source,
+            env=vc_environment(vcvars,'x64',b),log_path=b/'make-build.log',phase='GNU make bootstrap')
     out=b/('ffmpeg-'+a.kind);out.mkdir(exist_ok=True)
     decoders={'rm':'cook,atrac3,sipr,ra_144,ra_288,aac,ac3,eac3,mp3adu', 'vqf':'twinvq',
               'tak':'tak','asf':'wmav1,wmav2,wmapro,wmalossless,wmavoice'}[a.kind]
@@ -141,8 +159,14 @@ def main():
     env['PATH']=str(bash.parent.parent/'usr/bin')+';'+str(bash.parent)+';'+env['PATH']
     import shlex
     configure=' '.join(shlex.quote(s) for s in ['bash',(source/'configure').as_posix()]+options)
-    with (b/('ffmpeg-'+a.kind+'-configure.log')).open('w') as log:
-        subprocess.run([str(bash),'-c',configure],cwd=out,env=env,stdout=log,stderr=subprocess.STDOUT,check=True)
+    # FFmpeg configure creates this include-only file only when it is absent.
+    # Regenerate it after an identity change, including a prior failed build
+    # whose path was damaged by the old conversion. Never remove source files.
+    if out.resolve()==source.resolve():
+        raise RuntimeError('FFmpeg source and build directories must be different')
+    (out/'Makefile').unlink(missing_ok=True)
+    run_logged([str(bash),'-c',configure],cwd=out,env=env,
+        log_path=b/('ffmpeg-'+a.kind+'-configure.log'),phase='FFmpeg configure')
     configuration=(out/'config.h').read_text(encoding='utf-8')
     for forbidden in ('CONFIG_GPL','CONFIG_NONFREE','CONFIG_VERSION3','CONFIG_GPLV3'):
         if '#define '+forbidden+' 0' not in configuration:raise RuntimeError('Non-LGPL-2.1 backend profile: '+forbidden)
@@ -150,18 +174,15 @@ def main():
     # itself and therefore needs drive-letter paths rather than /c or /d paths.
     for path in (out/'Makefile',out/'ffbuild/config.mak'):
         content=path.read_text(encoding='utf-8')
-        for drive in 'abcdefghijklmnopqrstuvwxyz':
-            content=content.replace('/'+drive+'/',drive.upper()+':/')
-        path.write_text(content,encoding='utf-8')
-    with (b/('ffmpeg-'+a.kind+'-build.log')).open('w') as log:
-        # Fixed dependency sources: no locale-dependent /showIncludes parser is
-        # needed. Any configuration/script change rebuilds all dependency objects.
-        subprocess.run([str(make),'clean',
-            'SHELL='+(bash.parent.parent/'usr/bin/sh.exe').as_posix()],cwd=out,env=env,
-            stdout=log,stderr=subprocess.STDOUT,check=True)
-        subprocess.run([str(make),'-j4','CCDEP=','CXXDEP=','HOSTCCDEP=',
-            'SHELL='+(bash.parent.parent/'usr/bin/sh.exe').as_posix()],cwd=out,env=env,
-            stdout=log,stderr=subprocess.STDOUT,check=True)
+        path.write_text(native_make_paths(content),encoding='utf-8')
+    # Fixed dependency sources: no locale-dependent /showIncludes parser is
+    # needed. Any configuration/script change rebuilds all dependency objects.
+    build_log=b/('ffmpeg-'+a.kind+'-build.log')
+    shell='SHELL='+(bash.parent.parent/'usr/bin/sh.exe').as_posix()
+    run_logged([str(make),'clean',shell],cwd=out,env=env,
+        log_path=build_log,phase='FFmpeg clean')
+    run_logged([str(make),'-j4','CCDEP=','CXXDEP=','HOSTCCDEP=',shell],cwd=out,env=env,
+        log_path=build_log,phase='FFmpeg build',append=True)
     if not all(p.exists() for p in libraries):raise RuntimeError('FFmpeg static libraries missing')
     stamp.write_text(json.dumps(identity,indent=2),encoding='utf-8')
 

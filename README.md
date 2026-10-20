@@ -19,6 +19,9 @@ TTPlayer 5.7.9 兼容的 x86 TwinVQ/VQF Reader 插件。恢复原工厂、Reader
 
 [重建依据、差异和验证](docs/IMPLEMENTATION_AND_VALIDATION.md) · [依赖及修改记录](docs/DEPENDENCIES.md)
 
+2026-10-20 修复 GitHub Runner 的 `D:/a/...` 路径被误改导致 `make clean` 失败的问题，
+并补齐失败日志输出与 Action 日志附件，见 [构建修正记录](docs/ACTION_BUILD_FIX_20261020.md)。
+
 本项目恢复宿主行为和可维护解码实现；现代解码核心与原外部闭源库不保证 PCM 位精确相等。具体已验证范围和剩余边界见文档。
 
 ## 可选格式识别接口
