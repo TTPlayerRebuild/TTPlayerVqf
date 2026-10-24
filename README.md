@@ -1,5 +1,9 @@
 # ttp_vqf
 
+最新补全与验收：[2026-10-24](docs/COMPLETION_20261024.md)。
+
+定位取消恢复与缓存补充：[2026-10-24](docs/SEEK_RECOVERY_20261024.md)。
+
 TTPlayer 5.7.9 兼容的 x86 TwinVQ/VQF Reader 插件。恢复原工厂、Reader 和元数据 ABI，使用固定的 FFmpeg 9.0.2 最小静态后端；无需额外安装 VC 运行库或 tvqdec.dll。
 
 ## 构建

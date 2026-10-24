@@ -1,5 +1,6 @@
 #include "ttpcomm/audio_format_probe_impl.h"
 #include "io.h"
+#include "ttpcomm/pcm_history.h"
 #include <cmath>
 extern "C" {
 #include <libavformat/avformat.h>
@@ -21,6 +22,30 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
     std::vector<Tag> tags_; Bytes pcm_; size_t consumed_{};
     uint64_t position_{}; DWORD duration_{},bitrate_{};
     HRESULT io_error_{S_OK}; bool opened_{},draining_{},eof_{}; LONG stopped_{};
+    bool resume_pending_{}; uint64_t resume_position_{};
+    ttp::pcm::History history_;uint64_t decode_head_{};
+    void io_failure(HRESULT hr) {
+        io_error_=hr;
+        if(hr==E_ABORT || hr==HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+            if(input_.seekable) {
+                if(!resume_pending_) resume_position_=position_;
+                resume_pending_=true;
+            } else io_error_=STG_E_READFAULT;
+        }
+    }
+    void replay_to(uint64_t target) {
+        // A failed IStream read may have consumed input. Rebuild from a known
+        // position instead of clearing AVIO's error and skipping those bytes.
+        resume_pending_=true; resume_position_=target;
+        close_container(); input_.at(input_.base); position_=0; open_container();
+        if(primed_) { for(int i=0;i<2;++i) require(next(),STG_E_READFAULT); pcm_.clear();consumed_=0; }
+        while(position_<target) {
+            require(consumed_!=pcm_.size() || next(),STG_E_READFAULT);
+            auto n=std::min<uint64_t>(target-position_,(pcm_.size()-consumed_)/format_.nBlockAlign);
+            consumed_+=size_t(n)*format_.nBlockAlign;position_+=n;
+        }
+        resume_pending_=false;history_.clear();decode_head_=position_;
+    }
     std::wstring codec_name_;bool primed_{};
     static int read_callback(void *opaque,uint8_t *data,int bytes) noexcept {
         auto &s=*static_cast<AudioReader*>(opaque);ULONG got{};
@@ -28,7 +53,7 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
             require(bytes>0,E_INVALIDARG);require(!InterlockedCompareExchange(&s.stopped_,0,0),HRESULT_FROM_WIN32(ERROR_CANCELLED));
             got=s.input_.read(data,DWORD(bytes));return S_OK;
         });
-        if(FAILED(hr)){s.io_error_=hr;return AVERROR(EIO);}return got?int(got):AVERROR_EOF;
+        if(FAILED(hr)){s.io_failure(hr);return AVERROR(EIO);}return got?int(got):AVERROR_EOF;
     }
     static int64_t seek_callback(void *opaque,int64_t offset,int whence) noexcept {
         auto &s=*static_cast<AudioReader*>(opaque);int64_t result=-1;
@@ -197,25 +222,44 @@ public:
             check(buffer->SetLength(0));require(opened_,E_UNEXPECTED);require(!InterlockedCompareExchange(&stopped_,0,0),HRESULT_FROM_WIN32(ERROR_CANCELLED));
             DWORD capacity{},unused{};BYTE *out{};check(buffer->Capacity(&capacity));capacity-=capacity%format_.nBlockAlign;require(capacity,E_INVALIDARG);
             check(buffer->Data(&out,&unused));require(out,E_POINTER);
+            if(resume_pending_)replay_to(resume_position_);
+            if(position_<decode_head_){auto n=history_.read(position_,out,capacity,format_.nBlockAlign);require(n,E_UNEXPECTED);position_+=n/format_.nBlockAlign;return buffer->SetLength(n);}
             if(consumed_==pcm_.size()&&!next())return S_FALSE;
             auto n=DWORD(std::min<size_t>(capacity,pcm_.size()-consumed_));
-            memcpy(out,pcm_.data()+consumed_,n);consumed_+=n;position_+=n/format_.nBlockAlign;return buffer->SetLength(n);
+            memcpy(out,pcm_.data()+consumed_,n);
+            if(input_.seekable&&!input_.remote)history_.remember(position_,out,n,format_.nBlockAlign);
+            consumed_+=n;position_+=n/format_.nBlockAlign;decode_head_=position_;return buffer->SetLength(n);
         });
     }
     HRESULT STDMETHODCALLTYPE Seek(DWORD *milliseconds) override{
         if(!milliseconds)return E_POINTER;
-        return protect([&]()->HRESULT{
+        const auto rollback=resume_pending_?resume_position_:position_;
+        bool moving=false;
+        const auto result=protect([&]()->HRESULT{
             require(opened_,E_UNEXPECTED);require(input_.seekable,STG_E_INVALIDFUNCTION);
+            moving=true;
             uint64_t desired=uint64_t(*milliseconds)*format_.nSamplesPerSec/1000;
+            if(resume_pending_ || FAILED(io_error_))replay_to(0);
+            if(history_.contains(desired)){position_=desired;*milliseconds=ttp::vqf::milliseconds(position_,format_.nSamplesPerSec);return S_OK;}
+            position_=decode_head_;history_.clear();
             if(desired<position_){close_container();input_.at(input_.base);position_=0;open_container();
                 if(primed_){for(int i=0;i<2;++i)if(!next())break;pcm_.clear();consumed_=0;}}
             while(position_<desired){
                 if(consumed_==pcm_.size()&&!next())break;
                 auto n=std::min<uint64_t>(desired-position_,(pcm_.size()-consumed_)/format_.nBlockAlign);
+                // Keep the exact PCM decoded while positioning too. Repeated
+                // nearby seeks then reuse the same bounded history as Read.
+                if(!input_.remote)history_.remember(position_,pcm_.data()+consumed_,size_t(n)*format_.nBlockAlign,format_.nBlockAlign);
                 consumed_+=size_t(n)*format_.nBlockAlign;position_+=n;
             }
-            *milliseconds=ttp::vqf::milliseconds(position_,format_.nSamplesPerSec);return S_OK;
+            decode_head_=position_;*milliseconds=ttp::vqf::milliseconds(position_,format_.nSamplesPerSec);return S_OK;
         });
+        if(FAILED(result)&&moving){
+            // A failed seek did not publish a new position. A read or another
+            // seek must recover the last published position, not a partial scan.
+            resume_pending_=true;resume_position_=rollback;history_.clear();
+        }
+        return result;
     }
     HRESULT STDMETHODCALLTYPE Count(DWORD *out) override{if(!out)return E_POINTER;*out=DWORD(tags_.size());return S_OK;}
     HRESULT STDMETHODCALLTYPE At(DWORD n,wchar_t **key,wchar_t **value) override{
