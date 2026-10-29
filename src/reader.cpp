@@ -22,6 +22,7 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
     std::vector<Tag> tags_; Bytes pcm_; size_t consumed_{};
     uint64_t position_{}; DWORD duration_{},bitrate_{};
     HRESULT io_error_{S_OK}; bool opened_{},draining_{},eof_{}; LONG stopped_{};
+    HRESULT terminal_decode_error_{S_OK};
     bool resume_pending_{}; uint64_t resume_position_{};
     ttp::pcm::History history_;uint64_t decode_head_{};
     void io_failure(HRESULT hr) {
@@ -38,7 +39,10 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
         // position instead of clearing AVIO's error and skipping those bytes.
         resume_pending_=true; resume_position_=target;
         close_container(); input_.at(input_.base); position_=0; open_container();
-        if(primed_) { for(int i=0;i<2;++i) require(next(),STG_E_READFAULT); pcm_.clear();consumed_=0; }
+        if(primed_||priming_requested_) {
+            for(int i=0;i<2;++i)if(!next())break;
+            pcm_.clear();consumed_=0;primed_=true;priming_requested_=false;
+        }
         while(position_<target) {
             require(consumed_!=pcm_.size() || next(),STG_E_READFAULT);
             auto n=std::min<uint64_t>(target-position_,(pcm_.size()-consumed_)/format_.nBlockAlign);
@@ -46,7 +50,7 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
         }
         resume_pending_=false;history_.clear();decode_head_=position_;
     }
-    std::wstring codec_name_;bool primed_{};
+    std::wstring codec_name_;bool primed_{},priming_requested_{};
     static int read_callback(void *opaque,uint8_t *data,int bytes) noexcept {
         auto &s=*static_cast<AudioReader*>(opaque);ULONG got{};
         HRESULT hr=protect([&]()->HRESULT{
@@ -78,6 +82,7 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
     }
     void open_container(){
         io_error_=S_OK;draining_=eof_=false;pcm_.clear();consumed_=0;
+        terminal_decode_error_=S_OK;
         auto *buffer=static_cast<unsigned char*>(av_malloc(32768));require(buffer,E_OUTOFMEMORY);
         io_=avio_alloc_context(buffer,32768,0,this,read_callback,nullptr,input_.seekable?seek_callback:nullptr);
         if(!io_){av_free(buffer);throw Failure{E_OUTOFMEMORY};}
@@ -109,8 +114,10 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
         const auto *p=container_->streams[stream_index_]->codecpar;
         auto *codec=avcodec_find_decoder(p->codec_id);require(codec,E_NOTIMPL);
         decoder_=avcodec_alloc_context3(codec);require(decoder_,E_OUTOFMEMORY);
-        check_av(avcodec_parameters_to_context(decoder_,p));decoder_->thread_count=1;
-        check_av(avcodec_open2(decoder_,codec,nullptr));
+        try{
+            check_av(avcodec_parameters_to_context(decoder_,p));decoder_->thread_count=1;
+            check_av(avcodec_open2(decoder_,codec,nullptr));
+        }catch(...){avcodec_free_context(&decoder_);throw;}
     }
     static float sample(const AVFrame *f,int index,int channel){
         const auto fmt=AVSampleFormat(f->format);const auto packed=av_get_packed_sample_fmt(fmt);
@@ -138,6 +145,18 @@ class AudioReader final : public Reader, public Metadata, public ttp::format::In
         }
     }
     bool next(){
+        // Invalid frame syntax cannot be recovered by reading the following
+        // packet with a partial predictive history. Keep the failure across
+        // Read/Start and cached replay; reopening reconstructs the history.
+        check(terminal_decode_error_);
+        try{return next_impl();}
+        catch(const Failure &e){
+            if(SUCCEEDED(io_error_)&&e.code==HRESULT_FROM_WIN32(ERROR_INVALID_DATA))
+                terminal_decode_error_=e.code;
+            throw;
+        }
+    }
+    bool next_impl(){
         prepare();if(eof_)return false;
         for(unsigned attempts=0;attempts<100000;++attempts){
             auto result=avcodec_receive_frame(decoder_,frame_);
@@ -210,7 +229,15 @@ public:
         return protect([&]()->HRESULT{
             // 801D1AD7 primes the original external decoder by two frames once.
             // Keep raw Read-before-callback behavior separately for ABI callers.
-            if(decoder_&&!primed_){for(int i=0;i<2;++i)if(!next())break;pcm_.clear();consumed_=0;primed_=true;}
+            if(resume_pending_)replay_to(resume_position_);
+            if(decoder_&&!primed_){
+                // Cancellation can consume compressed bytes before this call
+                // returns. Preserve the requested two-frame timeline so both
+                // a callback retry and Start/Read restore the same PCM origin.
+                priming_requested_=true;
+                for(int i=0;i<2;++i)if(!next())break;
+                pcm_.clear();consumed_=0;primed_=true;priming_requested_=false;
+            }
             return input_.callback(p);
         });
     }
